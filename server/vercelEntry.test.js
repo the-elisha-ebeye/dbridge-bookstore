@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
 import handler from "../api/[...path].js";
+
+test("Vercel SPA fallback excludes API requests", async () => {
+  const config = JSON.parse(await readFile(new URL("../vercel.json", import.meta.url), "utf8"));
+  const [spaRewrite] = config.rewrites;
+
+  assert.equal(spaRewrite.source, "/:path((?!api/).*)");
+  assert.equal(spaRewrite.destination, "/index.html");
+});
 
 test("Vercel catch-all serves API routes through the existing Express app", async () => {
   const server = createServer(handler);
