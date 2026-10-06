@@ -45,6 +45,72 @@ function createAuthenticationMiddleware(authClient, logger) {
   };
 }
 
+async function getOrCreateCart(adminClient, userId) {
+  const { data: cart, error: cartError } = await adminClient
+    .from("carts")
+    .select("id")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (cartError) throw cartError;
+  if (cart) return cart;
+
+  const { data: createdCart, error: createError } = await adminClient
+    .from("carts")
+    .insert({ user_id: userId })
+    .select("id")
+    .single();
+
+  if (createError) throw createError;
+  return createdCart;
+}
+
+async function getCartItems(adminClient, cartId) {
+  const { data: rows, error: rowsError } = await adminClient
+    .from("cart_items")
+    .select("id, product_id, quantity")
+    .eq("cart_id", cartId);
+
+  if (rowsError) throw rowsError;
+
+  const items = [];
+  for (const row of rows ?? []) {
+    const { data: product, error: productError } = await adminClient
+      .from("products")
+      .select("id, title, author, category, image_url, price, stock_quantity, is_available")
+      .eq("id", row.product_id)
+      .maybeSingle();
+
+    if (productError) throw productError;
+    if (!product || !product.is_available || product.stock_quantity <= 0) continue;
+
+    items.push({
+      id: product.id,
+      title: product.title,
+      author: product.author,
+      category: product.category,
+      image_url: product.image_url,
+      price: Number(product.price),
+      stock_quantity: Number(product.stock_quantity),
+      quantity: Number(row.quantity),
+      subtotal: Number(product.price) * Number(row.quantity),
+    });
+  }
+
+  return items;
+}
+
+async function getDbProduct(adminClient, productId) {
+  const { data: product, error } = await adminClient
+    .from("products")
+    .select("id, title, author, category, image_url, price, stock_quantity, is_available")
+    .eq("id", productId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return product;
+}
+
 async function sendAndRecordEmail({ adminClient, sendConfirmationEmail, order, items, recipient, attempts = 0, logger }) {
   let status = "sent";
   let lastError = null;
@@ -180,6 +246,187 @@ export function createApp({
       emailStatus: emailResult.emailStatus,
       emailMessage: emailResult.emailMessage,
     });
+  });
+
+  app.get("/api/cart", authenticate, async (request, response) => {
+    if (!adminClient) {
+      return response.status(503).json({ message: "The cart database is not configured on the server." });
+    }
+
+    try {
+      const cart = await getOrCreateCart(adminClient, request.authUser.id);
+      const items = await getCartItems(adminClient, cart.id);
+      return response.json({ items });
+    } catch (error) {
+      logger.error("Could not load a user's cart:", describeError(error));
+      return response.status(500).json({ message: "We could not load your cart right now." });
+    }
+  });
+
+  app.post("/api/cart", authenticate, async (request, response) => {
+    if (!adminClient) {
+      return response.status(503).json({ message: "The cart database is not configured on the server." });
+    }
+
+    const productId = String(request.body?.productId ?? "").trim();
+    const quantity = Number(request.body?.quantity ?? 1);
+
+    if (!productId) {
+      return response.status(400).json({ message: "A product is required to add to your cart." });
+    }
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      return response.status(400).json({ message: "Cart quantities must be whole numbers greater than zero." });
+    }
+
+    try {
+      const product = await getDbProduct(adminClient, productId);
+      if (!product) {
+        return response.status(404).json({ message: "That book is no longer available." });
+      }
+      if (!product.is_available) {
+        return response.status(409).json({ message: "That book is no longer available to order." });
+      }
+
+      const cart = await getOrCreateCart(adminClient, request.authUser.id);
+      const { data: existingRow, error: existingError } = await adminClient
+        .from("cart_items")
+        .select("id, quantity")
+        .eq("cart_id", cart.id)
+        .eq("product_id", productId)
+        .maybeSingle();
+
+      if (existingError) throw existingError;
+
+      const nextQuantity = (existingRow?.quantity ?? 0) + quantity;
+      if (nextQuantity > Number(product.stock_quantity)) {
+        return response.status(409).json({ message: "This book is no longer available in the requested quantity." });
+      }
+
+      if (existingRow) {
+        const { error: updateError } = await adminClient
+          .from("cart_items")
+          .update({ quantity: nextQuantity, updated_at: new Date().toISOString() })
+          .eq("id", existingRow.id);
+
+        if (updateError) throw updateError;
+      } else {
+        const { error: insertError } = await adminClient
+          .from("cart_items")
+          .insert({ cart_id: cart.id, product_id: productId, quantity: nextQuantity });
+
+        if (insertError) throw insertError;
+      }
+
+      const items = await getCartItems(adminClient, cart.id);
+      return response.status(201).json({ items });
+    } catch (error) {
+      logger.error("Could not add a product to a user's cart:", describeError(error));
+      return response.status(500).json({ message: "We could not update your cart right now." });
+    }
+  });
+
+  app.put("/api/cart/:productId", authenticate, async (request, response) => {
+    if (!adminClient) {
+      return response.status(503).json({ message: "The cart database is not configured on the server." });
+    }
+
+    const productId = String(request.params.productId ?? "").trim();
+    const quantity = Number(request.body?.quantity ?? 0);
+
+    if (!productId) {
+      return response.status(400).json({ message: "A valid product is required." });
+    }
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      return response.status(400).json({ message: "Cart quantities must be whole numbers greater than zero." });
+    }
+
+    try {
+      const product = await getDbProduct(adminClient, productId);
+      if (!product) {
+        return response.status(404).json({ message: "That book is no longer available." });
+      }
+      if (!product.is_available) {
+        return response.status(409).json({ message: "That book is no longer available to order." });
+      }
+      if (quantity > Number(product.stock_quantity)) {
+        return response.status(409).json({ message: "This book is no longer available in the requested quantity." });
+      }
+
+      const cart = await getOrCreateCart(adminClient, request.authUser.id);
+      const { data: existingRow, error: existingError } = await adminClient
+        .from("cart_items")
+        .select("id")
+        .eq("cart_id", cart.id)
+        .eq("product_id", productId)
+        .maybeSingle();
+
+      if (existingError) throw existingError;
+      if (!existingRow) {
+        return response.status(404).json({ message: "That item is not in your cart." });
+      }
+
+      const { error: updateError } = await adminClient
+        .from("cart_items")
+        .update({ quantity, updated_at: new Date().toISOString() })
+        .eq("id", existingRow.id);
+
+      if (updateError) throw updateError;
+
+      const items = await getCartItems(adminClient, cart.id);
+      return response.json({ items });
+    } catch (error) {
+      logger.error("Could not update a user's cart item:", describeError(error));
+      return response.status(500).json({ message: "We could not update your cart right now." });
+    }
+  });
+
+  app.delete("/api/cart/:productId", authenticate, async (request, response) => {
+    if (!adminClient) {
+      return response.status(503).json({ message: "The cart database is not configured on the server." });
+    }
+
+    const productId = String(request.params.productId ?? "").trim();
+    if (!productId) {
+      return response.status(400).json({ message: "A valid product is required." });
+    }
+
+    try {
+      const cart = await getOrCreateCart(adminClient, request.authUser.id);
+      const { error: deleteError } = await adminClient
+        .from("cart_items")
+        .delete()
+        .eq("cart_id", cart.id)
+        .eq("product_id", productId);
+
+      if (deleteError) throw deleteError;
+
+      const items = await getCartItems(adminClient, cart.id);
+      return response.json({ items });
+    } catch (error) {
+      logger.error("Could not remove a user's cart item:", describeError(error));
+      return response.status(500).json({ message: "We could not update your cart right now." });
+    }
+  });
+
+  app.delete("/api/cart", authenticate, async (request, response) => {
+    if (!adminClient) {
+      return response.status(503).json({ message: "The cart database is not configured on the server." });
+    }
+
+    try {
+      const cart = await getOrCreateCart(adminClient, request.authUser.id);
+      const { error: clearError } = await adminClient
+        .from("cart_items")
+        .delete()
+        .eq("cart_id", cart.id);
+
+      if (clearError) throw clearError;
+
+      return response.json({ items: [] });
+    } catch (error) {
+      logger.error("Could not clear a user's cart:", describeError(error));
+      return response.status(500).json({ message: "We could not clear your cart right now." });
+    }
   });
 
   app.use("/api/admin", authenticate, createAdminRouter({ adminClient, logger }));
